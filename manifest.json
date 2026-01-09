@@ -16,10 +16,10 @@
   "icon_path": "favicon.ico",
   "landing_page_url": "/",
   "php_binary_path": "php/php.exe",
-  "public_root": "resources/app/public",
+  "public_root": "app/public",
   "scramble_code": true,
   "scramble_plugin_path": "src/plugins/scrambler.py",
   "clean_on_exit": true,
-  "uninstall_shortcut": true,
+  "uninstall_shortcut": false,
   "allowed_demo_duration_minutes": 60
 }

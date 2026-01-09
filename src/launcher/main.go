@@ -1,9 +1,11 @@
 package main
 
 import (
+	"embed"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io/fs"
 	"io/ioutil"
 	"net"
 	"os"
@@ -14,6 +16,9 @@ import (
 	"syscall"
 	"time"
 )
+
+//go:embed bundle/*
+var bundleFS embed.FS
 
 // Manifest matches the structure of manifest.json
 type Manifest struct {
@@ -40,29 +45,35 @@ type Manifest struct {
 }
 
 var (
-	uninstallFlag = flag.Bool("uninstall", false, "Clean up all demo files and exit")
+	uninstallFlag = flag.Bool("uninstall", false, "Clean up any temporary files (automated on exit)")
 )
 
 func main() {
 	flag.Parse()
 
-	// 1. Read Configuration
-	manifestPath := "manifest.json"
-	// In a real scenario, this might be embedded or next to the executable
-	exePath, err := os.Executable()
-	if err == nil {
-		manifestPath = filepath.Join(filepath.Dir(exePath), "manifest.json")
+	// 0. Extract Bundle to Temp Dir
+	tempDir, err := os.MkdirTemp("", "laravel_demo_")
+	if err != nil {
+		fmt.Printf("Error creating temp dir: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() {
+		fmt.Println("Cleaning up...")
+		os.RemoveAll(tempDir)
+	}()
+
+	// Extract files
+	if err := extractBundle(tempDir); err != nil {
+		fmt.Printf("Error extracting bundle: %v\n", err)
+		os.Exit(1)
 	}
 
-	// Fallback to current dir if not found (mostly for dev)
-	if _, err := os.Stat(manifestPath); os.IsNotExist(err) {
-		manifestPath = "manifest.json"
-	}
+	// 1. Read Configuration (from extracted path)
+	manifestPath := filepath.Join(tempDir, "bundle", "manifest.json")
 
 	data, err := ioutil.ReadFile(manifestPath)
 	if err != nil {
 		fmt.Printf("Error reading manifest: %v\n", err)
-		// Try minimal default if manifest fails? No, better to fail.
 		os.Exit(1)
 	}
 
@@ -72,9 +83,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 2. Handle Uninstall
+	// 2. Handle Uninstall (Mostly for show in this ephemeral mode)
 	if *uninstallFlag {
-		performUninstall(&config)
+		fmt.Println("This application runs from temporary storage and cleans up automatically on exit.")
+		// We could force clean common temp patterns if we used a fixed path,
+		// but with random temp dirs, there is nothing to 'uninstall' unless running.
 		return
 	}
 
@@ -89,24 +102,27 @@ func main() {
 	}
 
 	// 4. Start PHP Server
-	// Locate PHP binary. In dev, we might use system 'php'.
-	// In prod, it should be packaged relative to exe.
-	phpBin := config.PHPBinaryPath
+	// Locate PHP binary relative to extracted bundle
+	phpBin := filepath.Join(tempDir, "bundle", config.PHPBinaryPath)
 	if _, err := os.Stat(phpBin); os.IsNotExist(err) {
 		// Fallback to system php
 		phpBin = "php"
-	} else {
-		if filepath.IsAbs(phpBin) == false {
-			phpBin = filepath.Join(filepath.Dir(exePath), phpBin)
-		}
 	}
 
-	publicDir := config.PublicRoot
-	if filepath.IsAbs(publicDir) == false {
-		publicDir = filepath.Join(filepath.Dir(exePath), publicDir)
-	}
+	publicDir := filepath.Join(tempDir, "bundle", config.PublicRoot)
+
+	// Ensure database exists/is writable if configured inside bundle
+	// DBPath in manifest might be "database/database.sqlite" (relative to app)
+	// But app is in bundle/app or similar?
+	// The manifest says "db_path": "database/database.sqlite".
+	// We need to make sure the process runs with CWD that makes sense for Laravel,
+	// OR we assume everything is in 'publicDir/../../'
+
+	// Set CWD to the app root (parent of public usually)
+	appRoot := filepath.Dir(publicDir)
 
 	cmd := exec.Command(phpBin, "-S", fmt.Sprintf("127.0.0.1:%d", port), "-t", publicDir)
+	cmd.Dir = appRoot
 
 	// Inject Env Vars
 	env := os.Environ()
@@ -157,10 +173,46 @@ func main() {
 	}
 
 	// 7. Cleanup
-	if config.CleanOnExit {
-		// In a real app, this might delete the temp DB or log files
-		fmt.Println("Performing cleanup...")
+	// defer os.RemoveAll(tempDir) handles it.
+}
+
+func extractBundle(targetDir string) error {
+	// Ensure the root bundle directory exists
+	if err := os.MkdirAll(filepath.Join(targetDir, "bundle"), 0755); err != nil {
+		return err
 	}
+
+	return fs.WalkDir(bundleFS, "bundle", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		relPath, err := filepath.Rel("bundle", path)
+		if err != nil {
+			return err
+		}
+		if relPath == "." {
+			return nil
+		}
+
+		destPath := filepath.Join(targetDir, "bundle", relPath)
+
+		if d.IsDir() {
+			return os.MkdirAll(destPath, 0755)
+		}
+
+		// Ensure parent dir exists (just in case)
+		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+			return err
+		}
+
+		data, err := bundleFS.ReadFile(path)
+		if err != nil {
+			return err
+		}
+
+		return ioutil.WriteFile(destPath, data, 0755)
+	})
 }
 
 func getFreePort() (int, error) {
@@ -214,44 +266,5 @@ func openBrowser(url string, config Manifest) {
 }
 
 func performUninstall(config *Manifest) {
-	fmt.Println("Uninstalling/Cleaning up demo...")
-
-	// Determine paths relative to executable if needed
-	exePath, err := os.Executable()
-	if err != nil {
-		fmt.Printf("Error determining executable path: %v\n", err)
-		return
-	}
-	exeDir := filepath.Dir(exePath)
-
-	dbPath := config.DBPath
-	if !filepath.IsAbs(dbPath) {
-		dbPath = filepath.Join(exeDir, dbPath)
-	}
-
-	fmt.Printf("Removing database at %s...\n", dbPath)
-	if err := os.Remove(dbPath); err != nil {
-		if os.IsNotExist(err) {
-			fmt.Println("Database file does not exist, skipping.")
-		} else {
-			fmt.Printf("Error removing database: %v\n", err)
-		}
-	} else {
-		fmt.Println("Database removed.")
-	}
-
-	// Remove the resources folder if it looks like a demo environment
-	resourcesPath := filepath.Join(exeDir, "resources")
-	if _, err := os.Stat(resourcesPath); err == nil {
-		fmt.Println("Removing resources directory...")
-		if err := os.RemoveAll(resourcesPath); err != nil {
-			fmt.Printf("Error removing resources: %v\n", err)
-		} else {
-			fmt.Println("Resources removed.")
-		}
-	}
-
-	// Additional cleanup could go here (e.g. log files)
-
-	fmt.Println("Cleanup complete.")
+	// Deprecated in favor of ephemeral mode
 }

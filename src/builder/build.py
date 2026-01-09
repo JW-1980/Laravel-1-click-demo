@@ -10,8 +10,9 @@ class Builder:
         self.manifest_path = manifest_path
         self.config = self.load_manifest()
         self.build_dir = "build"
-        self.resources_dir = os.path.join(self.build_dir, "resources")
-        self.app_dir = os.path.join(self.resources_dir, "app")
+        # Bundle dir is inside src/launcher for embedding
+        self.bundle_dir = os.path.join("src", "launcher", "bundle")
+        self.app_dir = os.path.join(self.bundle_dir, "app")
 
     def load_manifest(self):
         with open(self.manifest_path, 'r') as f:
@@ -20,12 +21,33 @@ class Builder:
     def clean_build(self):
         if os.path.exists(self.build_dir):
             shutil.rmtree(self.build_dir)
+        os.makedirs(self.build_dir)
+
+        # Clean bundle dir (except .gitignore)
+        if os.path.exists(self.bundle_dir):
+            for item in os.listdir(self.bundle_dir):
+                if item == ".gitignore": continue
+                path = os.path.join(self.bundle_dir, item)
+                if os.path.isdir(path):
+                    shutil.rmtree(path)
+                else:
+                    os.remove(path)
+        else:
+            os.makedirs(self.bundle_dir)
+
         os.makedirs(self.app_dir)
 
     def copy_source(self, source_path):
         print(f"Copying source from {source_path} to {self.app_dir}...")
         # Ignore .git, build, etc.
         shutil.copytree(source_path, self.app_dir, dirs_exist_ok=True, ignore=shutil.ignore_patterns('.git', 'build', 'venv', '__pycache__'))
+
+        # Copy PHP if available
+        # Check source for 'php' folder or config
+        php_src = os.path.join(source_path, "php")
+        if os.path.exists(php_src):
+            print("Copying bundled PHP runtime...")
+            shutil.copytree(php_src, os.path.join(self.bundle_dir, "php"), dirs_exist_ok=True)
 
     def apply_scrambling(self):
         if not self.config.get('scramble_code', False):
@@ -84,37 +106,17 @@ class Builder:
             sys.exit(1)
 
     def bundle_config(self):
-        # Copy manifest to build dir so launcher can read it
-        shutil.copy(self.manifest_path, os.path.join(self.build_dir, "manifest.json"))
-
-    def create_uninstall_script(self, target_os):
-        if not self.config.get('uninstall_shortcut', False):
-            return
-
-        if target_os == "windows":
-            script_path = os.path.join(self.build_dir, "uninstall.bat")
-            exe_name = self.config.get('app_name', 'demo').replace(" ", "_").lower() + ".exe"
-            with open(script_path, "w") as f:
-                f.write("@echo off\n")
-                f.write(f'"{exe_name}" --uninstall\n')
-                f.write("pause\n")
-            print(f"Created uninstall script: {script_path}")
-        else:
-            script_path = os.path.join(self.build_dir, "uninstall.sh")
-            exe_name = self.config.get('app_name', 'demo').replace(" ", "_").lower()
-            with open(script_path, "w") as f:
-                f.write("#!/bin/sh\n")
-                f.write(f'./{exe_name} --uninstall\n')
-            os.chmod(script_path, 0o755)
-            print(f"Created uninstall script: {script_path}")
+        # Copy manifest to bundle dir for embedding
+        shutil.copy(self.manifest_path, os.path.join(self.bundle_dir, "manifest.json"))
 
     def build(self, source_path, target_os="linux"):
         self.clean_build()
         self.copy_source(source_path)
         self.apply_scrambling()
-        self.compile_launcher(target_os)
         self.bundle_config()
-        self.create_uninstall_script(target_os)
+        self.compile_launcher(target_os)
+        # Note: Uninstall script generation is less relevant for single-file exe
+        # but we can still generate it if needed. For now, skipping as per "Just click exe" philosophy.
         print("Build complete.")
 
 if __name__ == "__main__":
